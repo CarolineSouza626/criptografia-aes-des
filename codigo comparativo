@@ -1,0 +1,235 @@
+import time
+import secrets
+from typing import Tuple, List, Dict
+
+from Crypto.Cipher import AES, DES
+from Crypto.Random import get_random_bytes
+import matplotlib.pyplot as plt
+
+
+# =========================
+# PKCS7 Padding
+# =========================
+# pkcs7_pad: adiciona bytes extras ao final dos dados para que
+# o tamanho seja múltiplo do bloco (AES=16, DES=8).
+# pkcs7_unpad: remove esses bytes extras após a decifragem.
+def pkcs7_pad(data: bytes, block_size: int) -> bytes:
+    if block_size <= 0 or block_size > 255:
+        raise ValueError("block_size inválido para PKCS7")
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+def pkcs7_unpad(padded: bytes, block_size: int) -> bytes:
+    if not padded or len(padded) % block_size != 0:
+        raise ValueError("dados não são múltiplos do block_size")
+    pad_len = padded[-1]
+    if pad_len < 1 or pad_len > block_size:
+        raise ValueError("padding PKCS7 inválido")
+    if padded[-pad_len:] != bytes([pad_len] * pad_len):
+        raise ValueError("bytes de padding inconsistentes")
+    return padded[:-pad_len]
+
+
+# =========================
+# Utilitários
+# =========================
+# mb_from_bytes: converte número de bytes em megabytes.
+# gen_random_file_bytes: gera um "arquivo" sintético com bytes aleatórios.
+# make_aes_cbc: cria objeto de cifra AES em modo CBC.
+# make_des_cbc: cria objeto de cifra DES em modo CBC.
+
+def mb_from_bytes(n: int) -> float:
+    return n / (1024 * 1024)
+
+def gen_random_file_bytes(size_bytes: int) -> bytes:
+    return secrets.token_bytes(size_bytes)
+
+def make_aes_cbc(key: bytes, iv: bytes):
+    return AES.new(key, AES.MODE_CBC, iv=iv)
+
+def make_des_cbc(key: bytes, iv: bytes):
+    return DES.new(key, DES.MODE_CBC, iv=iv)
+
+
+# =========================
+# Medição de desempenho
+# =========================
+# - Recebe algoritmo, tamanho da chave, tamanho do bloco e dados.
+# - Executa cifra e decifra 10 vezes.
+# - Mede tempo médio de execução.
+# - Calcula throughput (MB/s) para cifra e decifra.
+# - Retorna um dicionário com resultados.
+
+def run_test(
+    alg_name: str,
+    key_bits: int,
+    block_size: int,
+    make_cipher,
+    data: bytes,
+    runs: int = 10,
+) -> Dict[str, float]:
+    key = get_random_bytes(key_bits // 8)
+
+    # ENCRYPT
+    enc_times = []
+    ciphertexts: List[bytes] = []
+    ivs: List[bytes] = []
+
+    for _ in range(runs):
+        iv = get_random_bytes(block_size)
+        ivs.append(iv)
+
+        cipher = make_cipher(key, iv)
+        padded = pkcs7_pad(data, block_size)
+
+        t0 = time.perf_counter()
+        ct = cipher.encrypt(padded)
+        t1 = time.perf_counter()
+
+        ciphertexts.append(ct)
+        enc_times.append(t1 - t0)
+
+    avg_enc_time = sum(enc_times) / runs
+    throughput_enc = mb_from_bytes(len(data)) / avg_enc_time if avg_enc_time > 0 else float("inf")
+
+    # DECRYPT
+    dec_times = []
+    for i in range(runs):
+        iv = ivs[i]
+        cipher = make_cipher(key, iv)
+        ct = ciphertexts[i]
+
+        t0 = time.perf_counter()
+        pt_padded = cipher.decrypt(ct)
+        pt = pkcs7_unpad(pt_padded, block_size)
+        t1 = time.perf_counter()
+
+        if pt != data:
+            raise ValueError(f"Decifragem falhou em {alg_name} ({key_bits} bits)")
+
+        dec_times.append(t1 - t0)
+
+    avg_dec_time = sum(dec_times) / runs
+    throughput_dec = mb_from_bytes(len(data)) / avg_dec_time if avg_dec_time > 0 else float("inf")
+
+    return {
+        "Algorithm": alg_name,
+        "KeyBits": key_bits,
+        "SizeBytes": len(data),
+        "AvgEncTimeSec": avg_enc_time,
+        "AvgDecTimeSec": avg_dec_time,
+        "EncThroughputMBps": throughput_enc,
+        "DecThroughputMBps": throughput_dec,
+    }
+
+
+# =========================
+# Execução principal
+# =========================
+# - Define tamanhos de arquivos (1KB, 1MB, 10MB).
+# - Define algoritmos a testar (AES-128, AES-256, DES-64).
+# - Executa run_test para cada combinação.
+# - Gera tabela comparativa no terminal.
+# - Plota gráficos de throughput (cifragem e decifragem).
+# - Retorna lista de resultados.
+
+def run_all():
+    sizes = [
+        1 * 1024,         # 1 KB
+        1 * 1024 * 1024,  # 1 MB
+        10 * 1024 * 1024, # 10 MB
+    ]
+    algs = [
+        ("AES", 128, 16, make_aes_cbc),
+        ("AES", 256, 16, make_aes_cbc),
+        ("DES", 64, 8, make_des_cbc),
+    ]
+
+    runs = 10
+    results: List[Dict[str, float]] = []
+
+    print(f"Executando {runs} execuções por teste com IV aleatório e PKCS7...")
+
+    for size in sizes:
+        data = gen_random_file_bytes(size)
+        for (name, kbits, bsize, factory) in algs:
+            res = run_test(
+                alg_name=name,
+                key_bits=kbits,
+                block_size=bsize,
+                make_cipher=factory,
+                data=data,
+                runs=runs,
+            )
+            results.append(res)
+
+    # Tabela em texto
+    headers = [
+        "Algorithm", "KeyBits", "Size", "AvgEncTime (s)", "AvgDecTime (s)", "Enc Throughput (MB/s)", "Dec Throughput (MB/s)"
+    ]
+    rows = []
+    for r in results:
+        rows.append([
+            f"{r['Algorithm']}",
+            f"{int(r['KeyBits'])}",
+            f"{mb_from_bytes(int(r['SizeBytes'])):.2f} MB",
+            f"{r['AvgEncTimeSec']:.6f}",
+            f"{r['AvgDecTimeSec']:.6f}",
+            f"{r['EncThroughputMBps']:.2f}",
+            f"{r['DecThroughputMBps']:.2f}",
+        ])
+
+    # Impressão simples
+    from itertools import zip_longest
+    col_widths = [max(len(h), *(len(row[i]) for row in rows)) for i, h in enumerate(headers)]
+    def format_row(cols, widths): return " | ".join(c.ljust(w) for c, w in zip(cols, widths))
+    print("\nRelatório comparativo:")
+    print(format_row(headers, col_widths))
+    print("-" * (sum(col_widths) + 3 * (len(headers) - 1)))
+    for row in rows:
+        print(format_row(row, col_widths))
+
+    # Gráficos
+    sizes_mb = [mb_from_bytes(s) for s in sizes]
+    perf_map: Dict[Tuple[str, int], Dict[int, Tuple[float, float]]] = {}
+    for r in results:
+        k = (r["Algorithm"], int(r["KeyBits"]))
+        perf_map.setdefault(k, {})[int(r["SizeBytes"])] = (r["EncThroughputMBps"], r["DecThroughputMBps"])
+
+    style_map = {
+        ("AES", 128): ("#1f77b4", "-"),
+        ("AES", 256): ("#ff7f0e", "--"),
+        ("DES", 64): ("#2ca02c", "-."),
+    }
+
+    # Cifragem
+    plt.figure(figsize=(8, 5))
+    for key, (color, ls) in style_map.items():
+        enc_tp = [perf_map[key][s][0] for s in sizes]
+        label = f"{key[0]}-{key[1]}"
+        plt.plot(sizes_mb, enc_tp, linestyle=ls, color=color, marker="o", label=label)
+    plt.title("Throughput de cifragem (MB/s) vs tamanho")
+    plt.xlabel("Tamanho do arquivo (MB)")
+    plt.ylabel("Throughput (MB/s)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Decifragem
+    plt.figure(figsize=(8, 5))
+    for key, (color, ls) in style_map.items():
+        dec_tp = [perf_map[key][s][1] for s in sizes]
+        label = f"{key[0]}-{key[1]}"
+        plt.plot(sizes_mb, dec_tp, linestyle=ls, color=color, marker="s", label=label)
+    plt.title("Throughput de decifragem (MB/s) vs tamanho")
+    plt.xlabel("Tamanho do arquivo (MB)")
+    plt.ylabel("Throughput (MB/s)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return results
+
+results = run_all()
